@@ -1,0 +1,2 @@
+/usr/bin/ar qc libdiskengine.a CMakeFiles/diskengine.dir/src/common/crc32_ieee.c.o CMakeFiles/diskengine.dir/src/superblock/superblock.c.o CMakeFiles/diskengine.dir/src/wal/wal.c.o CMakeFiles/diskengine.dir/src/wal/wal_apply_range.c.o CMakeFiles/diskengine.dir/src/alloc/range_alloc.c.o
+/usr/bin/ranlib libdiskengine.a
