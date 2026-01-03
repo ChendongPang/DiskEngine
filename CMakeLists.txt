@@ -16,8 +16,17 @@ add_library(diskengine STATIC
         src/engine/disk_engine.c
 )
 
+# KV layer (tombstone semantics) built on top of diskengine
+add_library(kvstore STATIC
+        src/kv/kv_store.c
+)
+target_link_libraries(kvstore diskengine)
+
 add_executable(demo_engine demo/demo_engine.c)
 target_link_libraries(demo_engine diskengine)
 
 add_executable(demo_kv demo/demo_kv.c)
 target_link_libraries(demo_kv diskengine)
+
+add_executable(demo_kv2 demo/demo_kv2.c)
+target_link_libraries(demo_kv2 kvstore)
