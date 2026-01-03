@@ -1,1 +1,0 @@
-/usr/bin/cc CMakeFiles/demo_engine.dir/demo/demo_engine.c.o -o demo_engine  libdiskengine.a

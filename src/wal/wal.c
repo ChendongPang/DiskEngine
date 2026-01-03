@@ -33,11 +33,11 @@ static int wal_hdr_sanity(const wal_t* wal, const wal_rec_hdr_t* h) {
   if (h->version != WAL_VERSION) return -1;
   if (h->header_sz != (uint32_t)sizeof(wal_rec_hdr_t)) return -1;
 
-  if (h->rec_len != align_up_u32((uint32_t)(h->header_sz + h->payload_len), WAL_REC_ALIGN)) return -1;
+  if (h->record_total_len != align_up_u32((uint32_t)(h->header_sz + h->payload_len), WAL_REC_ALIGN)) return -1;
 
   // bounds within WAL region
   uint64_t start = h->lsn;
-  uint64_t end   = start + (uint64_t)h->rec_len;
+  uint64_t end   = start + (uint64_t)h->record_total_len;
   if (start < wal_begin(wal) || end > wal_end(wal)) return -1;
 
   return 0;
@@ -54,7 +54,7 @@ static int wal_crc_check(const wal_t* wal, const wal_rec_hdr_t* hdr,
 
     uint32_t c = crc32_ieee_init();
     c = crc32_ieee_update(c, &tmp, tmp.header_sz);
-    c = crc32_ieee_update(c, payload_and_pad, tmp.rec_len - tmp.header_sz);
+    c = crc32_ieee_update(c, payload_and_pad, tmp.record_total_len - tmp.header_sz);
     c = crc32_ieee_final(c);
 
     return (c == old) ? 0 : -1;
@@ -100,8 +100,8 @@ int wal_open(int fd, const superblock_t* sb, uint64_t start_lsn, wal_t* out) {
       if (wal_hdr_sanity(&w, &hdr) != 0) break;
 
       // Read payload+pad for CRC check
-      uint32_t tail_len = hdr.rec_len - hdr.header_sz;
-      if (cur + hdr.rec_len > wal_end(&w)) break;
+      uint32_t tail_len = hdr.record_total_len - hdr.header_sz;
+      if (cur + hdr.record_total_len > wal_end(&w)) break;
 
       uint8_t* tail = (uint8_t*)malloc(tail_len);
       if (!tail) return -ENOMEM;
@@ -119,7 +119,7 @@ int wal_open(int fd, const superblock_t* sb, uint64_t start_lsn, wal_t* out) {
       if (hdr.lsn != cur) break;
       last_seq = hdr.seq;
 
-      cur += hdr.rec_len;
+      cur += hdr.record_total_len;
     }
 
     w.write_off = cur;
@@ -135,12 +135,12 @@ int wal_append(wal_t* wal, uint16_t type, const void* payload, uint32_t payload_
     if (payload_len > 0 && payload == NULL) return -EINVAL;
 
     uint32_t hdr_sz = (uint32_t)sizeof(wal_rec_hdr_t);
-    uint32_t rec_len = align_up_u32(hdr_sz + payload_len, WAL_REC_ALIGN);
-    uint32_t pad_len = rec_len - (hdr_sz + payload_len);
+    uint32_t record_total_len = align_up_u32(hdr_sz + payload_len, WAL_REC_ALIGN);
+    uint32_t pad_len = record_total_len - (hdr_sz + payload_len);
 
     uint64_t off = wal->write_off;
     if (off < wal_begin(wal) || off > wal_end(wal)) return -EINVAL;
-    if (off + rec_len > wal_end(wal)) return -ENOSPC; // v0 no wrap
+    if (off + record_total_len > wal_end(wal)) return -ENOSPC; // v0 no wrap
 
     // Build header
     wal_rec_hdr_t hdr;
@@ -154,11 +154,11 @@ int wal_append(wal_t* wal, uint16_t type, const void* payload, uint32_t payload_
     hdr.lsn        = off;            // absolute offset
     hdr.seq        = wal->next_seq;
     hdr.crc32      = 0;
-    hdr.rec_len    = rec_len;
+    hdr.record_total_len    = record_total_len;
 
     // Build tail buffer = payload + pad(zeros)
     uint8_t* tail = NULL;
-    uint32_t tail_len = rec_len - hdr_sz;
+    uint32_t tail_len = record_total_len - hdr_sz;
     if (tail_len > 0) {
       tail = (uint8_t*)malloc(tail_len);
       if (!tail) return -ENOMEM;
@@ -181,7 +181,7 @@ int wal_append(wal_t* wal, uint16_t type, const void* payload, uint32_t payload_
     free(tail);
 
     // Advance tail
-    wal->write_off += rec_len;
+    wal->write_off += record_total_len;
     wal->next_seq++;
 
     if (out_lsn) *out_lsn = hdr.lsn;
@@ -213,8 +213,8 @@ int wal_replay(const wal_t* wal, uint64_t start_lsn, wal_apply_fn apply, void* a
 
       if (wal_hdr_sanity(wal, &hdr) != 0) break;
 
-      uint32_t tail_len = hdr.rec_len - hdr.header_sz;
-      if (cur + hdr.rec_len > wal_end(wal)) break;
+      uint32_t tail_len = hdr.record_total_len - hdr.header_sz;
+      if (cur + hdr.record_total_len > wal_end(wal)) break;
 
       uint8_t* tail = (uint8_t*)malloc(tail_len);
       if (!tail) return -ENOMEM;
@@ -238,7 +238,7 @@ int wal_replay(const wal_t* wal, uint64_t start_lsn, wal_apply_fn apply, void* a
       last_lsn = hdr.lsn;
       last_seq = hdr.seq;
 
-      cur += hdr.rec_len;
+      cur += hdr.record_total_len;
     }
 
     if (out_last_lsn) *out_last_lsn = last_lsn;

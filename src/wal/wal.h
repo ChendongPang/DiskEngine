@@ -39,6 +39,18 @@ int wal_append(wal_t* wal, uint16_t type, const void* payload, uint32_t payload_
 // Ensure durability for appended records (v0: fdatasync).
 int wal_sync(wal_t* wal);
 
+// Close WAL (v0: no-op, kept for API symmetry).
+static inline void wal_close(wal_t* wal) { (void)wal; }
+
+// Convenience: append a WAL_REC_BLOB_PUT record.
+static inline int wal_append_blob_put(wal_t* wal, const wal_blob_put_payload_t* p,
+                                   uint64_t* out_lsn, uint64_t* out_seq) {
+  return wal_append(wal, WAL_REC_BLOB_PUT, p, (uint32_t)sizeof(*p), out_lsn, out_seq);
+}
+
+// Legacy alias
+static inline int wal_fsync(wal_t* wal) { return wal_sync(wal); }
+
 // Replay records starting from start_lsn (inclusive) until first invalid/torn record.
 // Returns 0; out_last_lsn set to last successfully applied record's lsn (or 0 if none).
 int wal_replay(const wal_t* wal, uint64_t start_lsn, wal_apply_fn apply, void* arg,
