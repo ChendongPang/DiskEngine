@@ -5,10 +5,18 @@ package dataplane.v1;
 option go_package = "dataplane/internal/rpc/pb;pb";
 
 service StorageNode {
-  rpc Put (PutRequest) returns (PutReply);
-  rpc Get (GetRequest) returns (GetReply);
-  rpc Del (DelRequest) returns (DelReply);
+  // Public API (client->gateway uses these)
+  rpc Put  (PutRequest) returns (PutReply);
+  rpc Get  (GetRequest) returns (GetReply);
+  rpc Del  (DelRequest) returns (DelReply);
   rpc Ping (PingRequest) returns (PingReply);
+
+  // Internal data-plane
+  rpc ClientWrite (ClientWriteRequest) returns (ClientWriteReply); // gateway -> primary
+  rpc Replicate   (ReplicateRequest)   returns (ReplicateReply);   // primary -> backup
+
+  // Control-plane lite
+  rpc Configure (ConfigureRequest) returns (ConfigureReply);       // gateway -> node
 }
 
 message PutRequest {
@@ -44,4 +52,59 @@ message PingRequest {}
 
 message PingReply {
   bool ok = 1;
+}
+
+// ---------- replication ----------
+
+enum Op {
+  OP_UNSPEC = 0;
+  OP_PUT = 1;
+  OP_DEL = 2;
+}
+
+message WriteEntry {
+  string key = 1;
+  bytes  value = 2;
+  Op     op = 3;
+
+  uint64 epoch = 4;   // fencing: must match current epoch
+  uint64 seq = 5;     // assigned by primary (monotonic per node)
+  string req_id = 6;  // idempotency token
+}
+
+message ClientWriteRequest {
+  WriteEntry entry = 1;
+}
+
+message ClientWriteReply {
+  bool ok = 1;
+  string error = 2;
+  uint64 seq = 3;
+}
+
+message ReplicateRequest {
+  WriteEntry entry = 1;
+}
+
+message ReplicateReply {
+  bool ok = 1;
+  string error = 2;
+}
+
+enum Role {
+  ROLE_UNSPEC = 0;
+  ROLE_PRIMARY = 1;
+  ROLE_BACKUP = 2;
+}
+
+message ConfigureRequest {
+  Role role = 1;
+  uint64 epoch = 2;
+  repeated string backups = 3; // only meaningful on primary
+  uint32 wq = 4;              // W quorum (include primary)
+}
+
+message ConfigureReply {
+  bool ok = 1;
+  string error = 2;
 }

@@ -16,6 +16,7 @@ typedef struct blob_loc_t {
     uint64_t blob_id;
     uint64_t off;
     uint64_t len;
+    uint64_t alloc_len;
 } blob_loc_t;
 
 typedef struct blob_kv_entry_t {

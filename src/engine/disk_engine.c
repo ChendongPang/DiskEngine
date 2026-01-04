@@ -203,12 +203,18 @@ static int wal_apply_engine(uint16_t type,
         loc.blob_id = p->blob_id;
         loc.off = p->data_off;      // blob record start offset
         loc.len = p->data_len;      // user payload len
+        loc.alloc_len = p->alloc_len;
 
         int r2 = blob_index_replay_put(e->idx, p->key, &loc);
         if (r2 != 0) return r2;
 
         if (p->blob_id >= e->next_blob_id) e->next_blob_id = p->blob_id + 1;
         return 0;
+    }
+
+    // Range allocator updates (used for FREE on overwrite).
+    if (type == WAL_REC_ALLOC_RANGE || type == WAL_REC_FREE_RANGE) {
+        return wal_apply_range(type, payload, payload_len, lsn, seq, &e->alloc);
     }
 
     // Unknown record types: ignore for forward compatibility
@@ -317,6 +323,10 @@ int disk_engine_put(disk_engine_t *e, const char *key, const void *data, size_t 
     if (!e || !key || !data || len == 0) return -EINVAL;
     if (len > UINT32_MAX) return -EINVAL;
 
+    // If key already exists, remember the old allocation so we can free it AFTER commit.
+    blob_loc_t old_loc;
+    int has_old = (blob_index_get(e->idx, key, &old_loc) == 0 && old_loc.alloc_len != 0);
+
     uint64_t rec_off = 0;
     uint64_t alloc_len = 0;
     int r = write_blob_record(e, data, (uint32_t)len, &rec_off, &alloc_len);
@@ -324,7 +334,7 @@ int disk_engine_put(disk_engine_t *e, const char *key, const void *data, size_t 
 
     uint64_t blob_id = e->next_blob_id++;
 
-    // WAL: one record is the commit point for both allocator replay + key->blob mapping
+    // WAL: BLOB_PUT is the commit point for both allocator replay + key->blob mapping.
     wal_blob_put_payload_t bp;
     memset(&bp, 0, sizeof(bp));
     strncpy(bp.key, key, sizeof(bp.key) - 1);
@@ -341,20 +351,44 @@ int disk_engine_put(disk_engine_t *e, const char *key, const void *data, size_t 
         return r;
     }
 
+    // If overwriting an existing key, log a FREE for the previous allocation.
+    // Ordering guarantee:
+    //   - if we crash before this FREE is durable, we may leak space, but never corrupt.
+    if (has_old) {
+        wal_range_payload_t fp;
+        fp.off = old_loc.off;
+        fp.len = old_loc.alloc_len;
+
+        int r2 = wal_append(&e->wal, WAL_REC_FREE_RANGE, &fp, (uint32_t)sizeof(fp), NULL, NULL);
+        if (r2 != 0) {
+            // We have already logged the new mapping, so do not roll back.
+            // Worst case: space leak until you add a real GC/checkpoint.
+            return r2;
+        }
+    }
+
     r = wal_sync(&e->wal);
     if (r != 0) {
+        // If WAL isn't durable, the new mapping isn't committed.
         (void)ra_free(&e->alloc, rec_off, alloc_len);
         return r;
     }
 
-    // Apply to in-memory index
+    // Apply in-memory FREE after WAL commit.
+    if (has_old) {
+        (void)ra_free(&e->alloc, old_loc.off, old_loc.alloc_len);
+    }
+
+    // Apply to in-memory index (include alloc_len so we can FREE on next overwrite)
     blob_loc_t loc;
     loc.blob_id = blob_id;
     loc.off = rec_off;
     loc.len = (uint64_t)len;
+    loc.alloc_len = alloc_len;
 
     return blob_index_put(e->idx, key, &loc);
 }
+
 
 int disk_engine_checkpoint(disk_engine_t *e)
 {

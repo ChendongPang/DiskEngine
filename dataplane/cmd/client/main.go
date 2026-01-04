@@ -30,7 +30,7 @@ flags:
 }
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:7001", "storagenode address")
+	addr := flag.String("addr", "127.0.0.1:8000", "gateway address")
 	timeout := flag.Duration("timeout", 3*time.Second, "rpc timeout")
 	flag.Parse()
 
