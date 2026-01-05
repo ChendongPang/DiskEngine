@@ -394,27 +394,22 @@ int disk_engine_checkpoint(disk_engine_t *e)
 {
     if (!e) return -EINVAL;
 
-    // Make sure all WAL writes are durable.
+    // 1) 确保 WAL 写入持久化（保持现有语义）
     int r = wal_sync(&e->wal);
     if (r != 0) return r;
 
-    // Stop-the-world MVP: wipe WAL region, reset wal_ckpt_lsn to 0.
-    // NOTE: This is safe because allocator+index state is already in memory and
-    // will be rebuilt by future WAL entries after this checkpoint.
-    r = wipe_zero(e->fd, e->sb.wal_off, e->sb.wal_len);
-    if (r != 0) return r;
-    if (fdatasync(e->fd) != 0) return -errno;
-
+    // 2) 只推进 superblock epoch（验证 A/B 双写），绝不 wipe/truncate WAL
+    //    因为你当前 blob_index 仅在内存里，重启恢复仍依赖 WAL replay。
     superblock_t next = e->sb;
     next.epoch = e->sb.epoch + 1;
-    next.wal_ckpt_lsn = 0;
+
+    // 关键：不要改 wal_ckpt_lsn，不要重置 wal.write_off/next_seq，不要 wipe WAL region
+    // next.wal_ckpt_lsn = e->sb.wal_ckpt_lsn;  // 保持不变（这行可写可不写）
 
     r = sb_write_next(e->fd, &e->sb, &next);
     if (r != 0) return r;
 
     e->sb = next;
-    e->wal.write_off = e->sb.wal_off;
-    e->wal.next_seq = 1;
     return 0;
 }
 

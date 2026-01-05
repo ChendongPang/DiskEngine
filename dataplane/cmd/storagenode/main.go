@@ -6,539 +6,626 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
-	"os/signal"
-	"strings"
 	"sync"
-	"sync/atomic"
-	"syscall"
 	"time"
 
 	"dataplane/internal/ckv"
-	"dataplane/internal/rpc/pb"
+	"dataplane/internal/oplog"
+	pb "dataplane/internal/rpc/pb"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/reflection"
 )
 
-// ---------- idempotency cache (MVP: in-memory TTL) ----------
-
-type idemEntry struct {
-	ok   bool
-	seq  uint64
-	err  string
-	when time.Time
-}
-
+// -----------------------------
+// Simple idempotency cache
+// -----------------------------
 type idemCache struct {
-	mu    sync.Mutex
-	data  map[string]idemEntry
-	ttl   time.Duration
-	limit int
+	mu sync.Mutex
+	m  map[string]*pb.ClientWriteReply
 }
 
-func newIdemCache(ttl time.Duration, limit int) *idemCache {
-	if ttl <= 0 {
-		ttl = 5 * time.Minute
-	}
-	if limit <= 0 {
-		limit = 200000
-	}
-	return &idemCache{
-		data:  make(map[string]idemEntry),
-		ttl:   ttl,
-		limit: limit,
-	}
-}
+func newIdem() *idemCache { return &idemCache{m: make(map[string]*pb.ClientWriteReply)} }
 
-func (c *idemCache) get(reqID string) (idemEntry, bool) {
-	if reqID == "" {
-		return idemEntry{}, false
-	}
+func (c *idemCache) get(k string) (*pb.ClientWriteReply, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	e, ok := c.data[reqID]
-	if !ok {
-		return idemEntry{}, false
-	}
-	if time.Since(e.when) > c.ttl {
-		delete(c.data, reqID)
-		return idemEntry{}, false
-	}
-	return e, true
+	v, ok := c.m[k]
+	return v, ok
 }
 
-func (c *idemCache) put(reqID string, e idemEntry) {
-	if reqID == "" {
-		return
-	}
+func (c *idemCache) put(k string, v *pb.ClientWriteReply) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	// cheap eviction
-	if len(c.data) >= c.limit {
-		for k, v := range c.data {
-			if time.Since(v.when) > c.ttl {
-				delete(c.data, k)
-				break
-			}
-		}
-		if len(c.data) >= c.limit {
-			for k := range c.data {
-				delete(c.data, k)
-				break
-			}
-		}
-	}
-	c.data[reqID] = e
+	c.m[k] = v
 }
 
-// ---------- grpc conn pool (primary -> backups) ----------
-
-type pool struct {
-	mu    sync.Mutex
-	conns map[string]*grpc.ClientConn
-}
-
-func newPool() *pool { return &pool{conns: make(map[string]*grpc.ClientConn)} }
-
-func (p *pool) get(addr string) (pb.StorageNodeClient, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if cc, ok := p.conns[addr]; ok {
-		return pb.NewStorageNodeClient(cc), nil
-	}
-	cc, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, err
-	}
-	p.conns[addr] = cc
-	return pb.NewStorageNodeClient(cc), nil
-}
-
-// ---------- server ----------
-
+// -----------------------------
+// StorageNode server
+// -----------------------------
 type server struct {
 	pb.UnimplementedStorageNodeServer
 
-	store *ckv.Store
+	mu   sync.Mutex
+	cond *sync.Cond
 
-	mu      sync.RWMutex
-	role    pb.Role
-	epoch   uint64
-	seq     uint64
+	addr string
+
+	role  pb.NodeRole
+	epoch uint64
+
+	primary string
 	backups []string
-	wq      int
+	wq      uint32
 
-	timeout time.Duration
-	pool    *pool
-	idem    *idemCache
+	seq          uint64
+	maxCommitted uint64
+
+	// prepared entries
+	prepared map[uint64]*pb.Operation
+
+	// commit can arrive out-of-order; buffer then drain in-order.
+	pendingCommit map[uint64]*pb.Operation
+
+	oplogPath string
+	ol        *oplog.Oplog
+	store     *ckv.Store
+
+	idem *idemCache
+
+	repairCh chan struct{}
 }
 
-func (s *server) curEpoch() uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.epoch
-}
-
-func (s *server) isPrimary() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.role == pb.Role_ROLE_PRIMARY
-}
-
-func (s *server) isBackup() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.role == pb.Role_ROLE_BACKUP
-}
-
-func (s *server) applyEntry(e *pb.WriteEntry) error {
-	switch e.Op {
-	case pb.Op_OP_PUT:
-		return s.store.Put(e.Key, e.Value)
-	case pb.Op_OP_DEL:
-		return s.store.Del(e.Key)
-	default:
-		return fmt.Errorf("unknown op: %v", e.Op)
-	}
-}
-
-// ---------- Public API (for gateway / debug) ----------
-
-func (s *server) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutReply, error) {
-	// Public Put is allowed only on primary (debug). Real path: gateway->ClientWrite.
-	if req == nil || req.Key == "" {
-		return &pb.PutReply{Ok: false, Error: "empty key"}, nil
-	}
-	if !s.isPrimary() {
-		return &pb.PutReply{Ok: false, Error: "not primary"}, nil
-	}
-	r, _ := s.ClientWrite(ctx, &pb.ClientWriteRequest{
-		Entry: &pb.WriteEntry{
-			Key:   req.Key,
-			Value: req.Value,
-			Op:    pb.Op_OP_PUT,
-			Epoch: s.curEpoch(),
-			ReqId: "manual",
-		},
-	})
-	if r == nil || !r.Ok {
-		msg := "put failed"
-		if r != nil && r.Error != "" {
-			msg = r.Error
-		}
-		return &pb.PutReply{Ok: false, Error: msg}, nil
-	}
-	return &pb.PutReply{Ok: true}, nil
-}
-
-func (s *server) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetReply, error) {
-	if req == nil || req.Key == "" {
-		return &pb.GetReply{Found: false, Error: "empty key"}, nil
-	}
-	v, found, err := s.store.Get(req.Key)
+func newServer(addr string, store *ckv.Store, oplogPath string) (*server, error) {
+	ol, err := oplog.Open(oplogPath)
 	if err != nil {
-		return &pb.GetReply{Found: false, Error: err.Error()}, nil
+		return nil, err
 	}
-	if !found {
-		return &pb.GetReply{Found: false}, nil
+	s := &server{
+		addr:          addr,
+		role:          pb.NodeRole_ROLE_UNKNOWN,
+		epoch:         0,
+		primary:       "",
+		backups:       nil,
+		wq:            0,
+		seq:           0,
+		maxCommitted:  0,
+		prepared:      make(map[uint64]*pb.Operation),
+		pendingCommit: make(map[uint64]*pb.Operation),
+		oplogPath:     oplogPath,
+		ol:            ol,
+		store:         store,
+		idem:          newIdem(),
+		repairCh:      make(chan struct{}, 1),
 	}
-	return &pb.GetReply{Found: true, Value: v}, nil
+	s.cond = sync.NewCond(&s.mu)
+
+	if err := s.replayOplog(); err != nil {
+		return nil, err
+	}
+	go s.repairLoop()
+	return s, nil
 }
 
-func (s *server) Del(ctx context.Context, req *pb.DelRequest) (*pb.DelReply, error) {
-	if req == nil || req.Key == "" {
-		return &pb.DelReply{Ok: false, Error: "empty key"}, nil
-	}
-	if !s.isPrimary() {
-		return &pb.DelReply{Ok: false, Error: "not primary"}, nil
-	}
-	r, _ := s.ClientWrite(ctx, &pb.ClientWriteRequest{
-		Entry: &pb.WriteEntry{
-			Key:   req.Key,
-			Op:    pb.Op_OP_DEL,
-			Epoch: s.curEpoch(),
-			ReqId: "manual",
-		},
-	})
-	if r == nil || !r.Ok {
-		msg := "del failed"
-		if r != nil && r.Error != "" {
-			msg = r.Error
-		}
-		return &pb.DelReply{Ok: false, Error: msg}, nil
-	}
-	return &pb.DelReply{Ok: true}, nil
+type replayHandler struct{ s *server }
+
+func (s *server) replayOplog() error {
+	return oplog.Replay(s.oplogPath, &replayHandler{s: s})
 }
 
-func (s *server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingReply, error) {
-	return &pb.PingReply{Ok: true}, nil
+func (h *replayHandler) OnPrepare(epoch uint64, seq uint64, op *pb.Operation) error {
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+
+	if seq > h.s.seq {
+		h.s.seq = seq
+	}
+	if epoch > h.s.epoch {
+		h.s.epoch = epoch
+	}
+	h.s.prepared[seq] = op
+	return nil
 }
 
-// ---------- Control-plane lite: Configure ----------
+func (h *replayHandler) OnCommit(epoch uint64, seq uint64) error {
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+
+	if seq > h.s.maxCommitted {
+		h.s.maxCommitted = seq
+	}
+	if seq > h.s.seq {
+		h.s.seq = seq
+	}
+	if epoch > h.s.epoch {
+		h.s.epoch = epoch
+	}
+	return nil
+}
+
+// -----------------------------
+// RPCs
+// -----------------------------
+func (s *server) Ping(ctx context.Context, req *pb.PingRequest) (*pb.PingReply, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return &pb.PingReply{
+		Ok:           true,
+		Role:         s.role,
+		Epoch:        s.epoch,
+		MaxCommitted: s.maxCommitted,
+	}, nil
+}
 
 func (s *server) Configure(ctx context.Context, req *pb.ConfigureRequest) (*pb.ConfigureReply, error) {
-	if req == nil {
-		return &pb.ConfigureReply{Ok: false, Error: "nil request"}, nil
-	}
-	if req.Epoch == 0 {
-		return &pb.ConfigureReply{Ok: false, Error: "epoch must be > 0"}, nil
-	}
-	if req.Role != pb.Role_ROLE_PRIMARY && req.Role != pb.Role_ROLE_BACKUP {
-		return &pb.ConfigureReply{Ok: false, Error: "invalid role"}, nil
-	}
-	newWQ := int(req.Wq)
-	if newWQ <= 0 {
-		newWQ = 2
-	}
-
-	bs := make([]string, 0, len(req.Backups))
-	for _, b := range req.Backups {
-		b = strings.TrimSpace(b)
-		if b != "" {
-			bs = append(bs, b)
-		}
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// epoch must be monotonic increasing (fence stale config)
-	if req.Epoch < s.epoch {
-		return &pb.ConfigureReply{Ok: false, Error: fmt.Sprintf("stale epoch: got=%d cur=%d", req.Epoch, s.epoch)}, nil
+	if req.GetEpoch() < s.epoch {
+		return &pb.ConfigureReply{Ok: false, Err: "stale epoch"}, nil
 	}
 
-	s.role = req.Role
-	s.epoch = req.Epoch
-	s.wq = newWQ
-	if s.role == pb.Role_ROLE_PRIMARY {
-		s.backups = bs
-	} else {
-		s.backups = nil
-	}
+	oldRole := s.role
+	s.epoch = req.GetEpoch()
+	s.role = req.GetRole()
+	s.primary = req.GetPrimaryAddr()
+	s.backups = append([]string{}, req.GetBackupAddrs()...)
+	s.wq = req.GetWq()
 
+	log.Printf("[node %s] Configure: role=%s epoch=%d primary=%s backups=%v wq=%d (oldRole=%s)",
+		s.addr, s.role.String(), s.epoch, s.primary, s.backups, s.wq, oldRole.String())
+
+	if s.role == pb.NodeRole_ROLE_PRIMARY && oldRole != pb.NodeRole_ROLE_PRIMARY {
+		select {
+		case s.repairCh <- struct{}{}:
+		default:
+		}
+	}
 	return &pb.ConfigureReply{Ok: true}, nil
 }
 
-// ---------- gateway -> primary: ClientWrite ----------
+func (s *server) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetReply, error) {
+	v, found, err := s.store.Get(req.GetKey())
+	if err != nil {
+		return &pb.GetReply{Ok: false, Err: err.Error()}, nil
+	}
+	if !found {
+		return &pb.GetReply{Ok: true, Found: false}, nil
+	}
+	return &pb.GetReply{Ok: true, Found: true, Value: v}, nil
+}
+
+func (s *server) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutReply, error) {
+	return &pb.PutReply{Ok: false, Err: "use gateway (ClientWrite)"}, nil
+}
+
+func (s *server) Del(ctx context.Context, req *pb.DelRequest) (*pb.DelReply, error) {
+	return &pb.DelReply{Ok: false, Err: "use gateway (ClientWrite)"}, nil
+}
 
 func (s *server) ClientWrite(ctx context.Context, req *pb.ClientWriteRequest) (*pb.ClientWriteReply, error) {
-	if req == nil || req.Entry == nil {
-		return &pb.ClientWriteReply{Ok: false, Error: "nil entry"}, nil
-	}
-	e := req.Entry
-	if e.Key == "" {
-		return &pb.ClientWriteReply{Ok: false, Error: "empty key"}, nil
-	}
-	if !s.isPrimary() {
-		return &pb.ClientWriteReply{Ok: false, Error: "not primary"}, nil
+	if v, ok := s.idem.get(req.GetReqId()); ok {
+		return v, nil
 	}
 
-	curEpoch := s.curEpoch()
-	if e.Epoch != curEpoch {
-		return &pb.ClientWriteReply{Ok: false, Error: fmt.Sprintf("epoch mismatch: got=%d want=%d", e.Epoch, curEpoch)}, nil
+	s.mu.Lock()
+	if s.role != pb.NodeRole_ROLE_PRIMARY {
+		s.mu.Unlock()
+		r := &pb.ClientWriteReply{Ok: false, Err: "not primary"}
+		s.idem.put(req.GetReqId(), r)
+		return r, nil
+	}
+	if req.GetEpoch() != s.epoch {
+		s.mu.Unlock()
+		r := &pb.ClientWriteReply{Ok: false, Err: "wrong epoch"}
+		s.idem.put(req.GetReqId(), r)
+		return r, nil
 	}
 
-	// idempotency
-	if cached, ok := s.idem.get(e.ReqId); ok {
-		return &pb.ClientWriteReply{Ok: cached.ok, Error: cached.err, Seq: cached.seq}, nil
-	}
-
-	seq := atomic.AddUint64(&s.seq, 1)
-	entry := &pb.WriteEntry{
-		Key:   e.Key,
-		Value: e.Value,
-		Op:    e.Op,
-		Epoch: curEpoch,
-		Seq:   seq,
-		ReqId: e.ReqId,
-	}
-
-	// apply locally first
-	if err := s.applyEntry(entry); err != nil {
-		s.idem.put(e.ReqId, idemEntry{ok: false, seq: seq, err: err.Error(), when: time.Now()})
-		return &pb.ClientWriteReply{Ok: false, Error: err.Error(), Seq: seq}, nil
-	}
-
-	// replicate to backups
-	s.mu.RLock()
+	s.seq++
+	seq := s.seq
+	epoch := s.epoch
+	op := req.GetOp()
 	backups := append([]string{}, s.backups...)
 	wq := s.wq
-	s.mu.RUnlock()
+	s.prepared[seq] = op
+	s.mu.Unlock()
 
-	needBackupAcks := wq - 1
-	if needBackupAcks < 0 {
-		needBackupAcks = 0
+	// local PREPARE durable
+	if err := s.ol.AppendPrepare(epoch, seq, req.GetReqId(), op); err != nil {
+		r := &pb.ClientWriteReply{Ok: false, Err: "oplog prepare: " + err.Error()}
+		s.idem.put(req.GetReqId(), r)
+		return r, nil
 	}
-	if needBackupAcks == 0 || len(backups) == 0 {
-		s.idem.put(e.ReqId, idemEntry{ok: true, seq: seq, when: time.Now()})
-		return &pb.ClientWriteReply{Ok: true, Seq: seq}, nil
+
+	// PREPARE quorum (wq-1)
+	needPrepare := int(wq) - 1
+	if needPrepare < 0 {
+		needPrepare = 0
 	}
-
-	cctx, cancel := context.WithTimeout(ctx, s.timeout)
-	defer cancel()
-
-	var mu sync.Mutex
-	acks := 0
-	var firstErr error
-
+	prepareAcks := 0
 	var wg sync.WaitGroup
-	wg.Add(len(backups))
-	for _, addr := range backups {
-		a := strings.TrimSpace(addr)
-		if a == "" {
-			wg.Done()
-			continue
-		}
-		go func(backupAddr string) {
+	var pmu sync.Mutex
+	var firstPrepareErr string
+
+	for _, b := range backups {
+		wg.Add(1)
+		go func(addr string) {
 			defer wg.Done()
-			cli, err := s.pool.get(backupAddr)
-			if err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				mu.Unlock()
+			ok, errStr := s.replicateOnce(addr, &pb.ReplicateRequest{
+				Epoch: epoch,
+				Phase: pb.ReplicationPhase_PHASE_PREPARE,
+				Op:    op,
+				ReqId: req.GetReqId(),
+				Seq:   seq,
+			})
+			if ok {
+				pmu.Lock()
+				prepareAcks++
+				pmu.Unlock()
 				return
 			}
-			r, err := cli.Replicate(cctx, &pb.ReplicateRequest{Entry: entry})
-			if err != nil || r == nil || !r.Ok {
-				mu.Lock()
-				if firstErr == nil {
-					if err != nil {
-						firstErr = err
-					} else if r != nil && r.Error != "" {
-						firstErr = fmt.Errorf(r.Error)
-					} else {
-						firstErr = fmt.Errorf("replicate failed: %s", backupAddr)
-					}
-				}
-				mu.Unlock()
-				return
+			pmu.Lock()
+			if firstPrepareErr == "" {
+				firstPrepareErr = errStr
 			}
-			mu.Lock()
-			acks++
-			mu.Unlock()
-		}(a)
+			pmu.Unlock()
+		}(b)
 	}
 	wg.Wait()
 
-	if acks >= needBackupAcks {
-		s.idem.put(e.ReqId, idemEntry{ok: true, seq: seq, when: time.Now()})
-		return &pb.ClientWriteReply{Ok: true, Seq: seq}, nil
+	if prepareAcks < needPrepare {
+		r := &pb.ClientWriteReply{Ok: false, Err: fmt.Sprintf("prepare quorum not reached: acks=%d need=%d err=%s", prepareAcks, needPrepare, firstPrepareErr)}
+		s.idem.put(req.GetReqId(), r)
+		return r, nil
 	}
 
-	if firstErr != nil {
-		s.idem.put(e.ReqId, idemEntry{ok: false, seq: seq, err: firstErr.Error(), when: time.Now()})
-		return &pb.ClientWriteReply{Ok: false, Error: firstErr.Error(), Seq: seq}, nil
+	// local COMMIT durable
+	if err := s.ol.AppendCommit(epoch, seq, req.GetReqId()); err != nil {
+		r := &pb.ClientWriteReply{Ok: false, Err: "oplog commit: " + err.Error()}
+		s.idem.put(req.GetReqId(), r)
+		return r, nil
 	}
 
-	s.idem.put(e.ReqId, idemEntry{ok: false, seq: seq, err: "write quorum not reached", when: time.Now()})
-	return &pb.ClientWriteReply{Ok: false, Error: "write quorum not reached", Seq: seq}, nil
+	// local APPLY
+	if err := applyOp(s.store, op); err != nil {
+		r := &pb.ClientWriteReply{Ok: false, Err: "apply: " + err.Error()}
+		s.idem.put(req.GetReqId(), r)
+		return r, nil
+	}
+
+	// advance local committed
+	s.mu.Lock()
+	if seq > s.maxCommitted {
+		s.maxCommitted = seq
+		s.cond.Broadcast()
+	}
+	s.mu.Unlock()
+
+	// -------- NEW: COMMIT quorum ack (wq-1) --------
+	needCommit := int(wq) - 1
+	if needCommit < 0 {
+		needCommit = 0
+	}
+	commitAcks := 0
+	var cwg sync.WaitGroup
+	var cmu sync.Mutex
+	var firstCommitErr string
+
+	for _, b := range backups {
+		cwg.Add(1)
+		go func(addr string) {
+			defer cwg.Done()
+			// commit carries full entry; backup can fill missing prepare.
+			ok, errStr := s.replicateOnce(addr, &pb.ReplicateRequest{
+				Epoch: epoch,
+				Phase: pb.ReplicationPhase_PHASE_COMMIT,
+				Op:    op,
+				ReqId: req.GetReqId(),
+				Seq:   seq,
+			})
+			if ok {
+				cmu.Lock()
+				commitAcks++
+				cmu.Unlock()
+				return
+			}
+			cmu.Lock()
+			if firstCommitErr == "" {
+				firstCommitErr = errStr
+			}
+			cmu.Unlock()
+		}(b)
+	}
+	cwg.Wait()
+
+	if commitAcks < needCommit {
+		r := &pb.ClientWriteReply{Ok: false, Err: fmt.Sprintf("commit quorum not reached: acks=%d need=%d err=%s", commitAcks, needCommit, firstCommitErr)}
+		s.idem.put(req.GetReqId(), r)
+		return r, nil
+	}
+
+	r := &pb.ClientWriteReply{Ok: true}
+	s.idem.put(req.GetReqId(), r)
+	return r, nil
 }
 
-// ---------- primary -> backup: Replicate ----------
-
 func (s *server) Replicate(ctx context.Context, req *pb.ReplicateRequest) (*pb.ReplicateReply, error) {
-	if req == nil || req.Entry == nil {
-		return &pb.ReplicateReply{Ok: false, Error: "nil entry"}, nil
+	s.mu.Lock()
+	if s.role != pb.NodeRole_ROLE_BACKUP {
+		mc := s.maxCommitted
+		s.mu.Unlock()
+		return &pb.ReplicateReply{Ok: false, Err: "not backup", MaxCommitted: mc}, nil
 	}
-	e := req.Entry
-	if e.Key == "" {
-		return &pb.ReplicateReply{Ok: false, Error: "empty key"}, nil
+	if req.GetEpoch() != s.epoch {
+		mc := s.maxCommitted
+		s.mu.Unlock()
+		return &pb.ReplicateReply{Ok: false, Err: "wrong epoch", MaxCommitted: mc}, nil
 	}
-	if !s.isBackup() {
-		return &pb.ReplicateReply{Ok: false, Error: "not backup"}, nil
-	}
+	s.mu.Unlock()
 
-	curEpoch := s.curEpoch()
-	if e.Epoch != curEpoch {
-		return &pb.ReplicateReply{Ok: false, Error: fmt.Sprintf("epoch mismatch: got=%d want=%d", e.Epoch, curEpoch)}, nil
-	}
+	switch req.GetPhase() {
+	case pb.ReplicationPhase_PHASE_PREPARE:
+		seq := req.GetSeq()
+		op := req.GetOp()
 
-	// idempotency
-	if cached, ok := s.idem.get(e.ReqId); ok {
-		if cached.ok {
-			return &pb.ReplicateReply{Ok: true}, nil
+		s.mu.Lock()
+		_, exists := s.prepared[seq]
+		mc := s.maxCommitted
+		s.mu.Unlock()
+
+		if exists || seq <= mc {
+			return &pb.ReplicateReply{Ok: true, MaxCommitted: mc}, nil
 		}
-		return &pb.ReplicateReply{Ok: false, Error: cached.err}, nil
+		if err := s.ol.AppendPrepare(req.GetEpoch(), seq, req.GetReqId(), op); err != nil {
+			return &pb.ReplicateReply{Ok: false, Err: "oplog prepare: " + err.Error(), MaxCommitted: s.getMaxCommitted()}, nil
+		}
+		s.mu.Lock()
+		s.prepared[seq] = op
+		s.mu.Unlock()
+
+		_ = s.drainCommitsInOrder(req.GetEpoch())
+		return &pb.ReplicateReply{Ok: true, MaxCommitted: s.getMaxCommitted()}, nil
+
+	case pb.ReplicationPhase_PHASE_COMMIT:
+		seq := req.GetSeq()
+		op := req.GetOp()
+
+		s.mu.Lock()
+		if seq <= s.maxCommitted {
+			mc := s.maxCommitted
+			s.mu.Unlock()
+			return &pb.ReplicateReply{Ok: true, MaxCommitted: mc}, nil
+		}
+		s.pendingCommit[seq] = op
+		s.mu.Unlock()
+
+		_ = s.drainCommitsInOrder(req.GetEpoch())
+
+		// IMPORTANT: only return OK after THIS seq is committed (durable+apply).
+		if err := s.waitCommitted(ctx, seq); err != nil {
+			return &pb.ReplicateReply{Ok: false, Err: err.Error(), MaxCommitted: s.getMaxCommitted()}, nil
+		}
+		return &pb.ReplicateReply{Ok: true, MaxCommitted: s.getMaxCommitted()}, nil
+
+	default:
+		return &pb.ReplicateReply{Ok: false, Err: "bad phase", MaxCommitted: s.getMaxCommitted()}, nil
+	}
+}
+
+func (s *server) getMaxCommitted() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maxCommitted
+}
+
+func (s *server) waitCommitted(ctx context.Context, seq uint64) error {
+	deadline, hasDL := ctx.Deadline()
+	for {
+		s.mu.Lock()
+		mc := s.maxCommitted
+		s.mu.Unlock()
+		if mc >= seq {
+			return nil
+		}
+		if hasDL && time.Now().After(deadline) {
+			return fmt.Errorf("commit wait timeout for seq=%d (mc=%d)", seq, mc)
+		}
+		time.Sleep(5 * time.Millisecond)
+		_ = s.drainCommitsInOrder(0)
+	}
+}
+
+func (s *server) drainCommitsInOrder(epoch uint64) error {
+	for {
+		s.mu.Lock()
+		next := s.maxCommitted + 1
+		opCommit, ok := s.pendingCommit[next]
+		s.mu.Unlock()
+		if !ok {
+			return nil
+		}
+
+		s.mu.Lock()
+		opPrep, hasPrep := s.prepared[next]
+		s.mu.Unlock()
+		if !hasPrep {
+			if err := s.ol.AppendPrepare(epoch, next, "fill", opCommit); err != nil {
+				return fmt.Errorf("fill prepare: %w", err)
+			}
+			s.mu.Lock()
+			s.prepared[next] = opCommit
+			opPrep = opCommit
+			s.mu.Unlock()
+		}
+
+		if err := s.ol.AppendCommit(epoch, next, "commit"); err != nil {
+			return fmt.Errorf("append commit: %w", err)
+		}
+		if err := applyOp(s.store, opPrep); err != nil {
+			return fmt.Errorf("apply: %w", err)
+		}
+
+		s.mu.Lock()
+		delete(s.pendingCommit, next)
+		delete(s.prepared, next)
+		s.maxCommitted = next
+		s.cond.Broadcast()
+		s.mu.Unlock()
+	}
+}
+
+// -----------------------------
+// Primary repair loop (沿用你已有逻辑：promote 后把落后 backup 追齐)
+// -----------------------------
+func (s *server) repairLoop() {
+	for range s.repairCh {
+		time.Sleep(50 * time.Millisecond)
+		s.repairBackups()
+	}
+}
+
+func (s *server) repairBackups() {
+	s.mu.Lock()
+	if s.role != pb.NodeRole_ROLE_PRIMARY {
+		s.mu.Unlock()
+		return
+	}
+	epoch := s.epoch
+	backups := append([]string{}, s.backups...)
+	primaryMax := s.maxCommitted
+	oplogPath := s.oplogPath
+	s.mu.Unlock()
+
+	if len(backups) == 0 {
+		return
 	}
 
-	if err := s.applyEntry(e); err != nil {
-		s.idem.put(e.ReqId, idemEntry{ok: false, seq: e.Seq, err: err.Error(), when: time.Now()})
-		return &pb.ReplicateReply{Ok: false, Error: err.Error()}, nil
-	}
+	for _, b := range backups {
+		mc, err := s.getBackupCommitted(b)
+		if err != nil {
+			log.Printf("[node %s] repair: ping backup %s err=%v", s.addr, b, err)
+			continue
+		}
+		if mc >= primaryMax {
+			continue
+		}
+		log.Printf("[node %s] repair: backup %s lagging mc=%d primary=%d", s.addr, b, mc, primaryMax)
 
-	s.idem.put(e.ReqId, idemEntry{ok: true, seq: e.Seq, when: time.Now()})
-	return &pb.ReplicateReply{Ok: true}, nil
+		for seq := mc + 1; seq <= primaryMax; seq++ {
+			op, _, err := oplog.ReadPrepareBySeq(oplogPath, seq)
+			if err != nil {
+				log.Printf("[node %s] repair: read prepare seq=%d err=%v", s.addr, seq, err)
+				break
+			}
+			ok, errStr := s.replicateOnce(b, &pb.ReplicateRequest{
+				Epoch: epoch,
+				Phase: pb.ReplicationPhase_PHASE_COMMIT,
+				Op:    op,
+				ReqId: fmt.Sprintf("repair-%d", seq),
+				Seq:   seq,
+			})
+			if !ok {
+				log.Printf("[node %s] repair: send commit to %s seq=%d err=%s", s.addr, b, seq, errStr)
+				break
+			}
+		}
+	}
+}
+
+func (s *server) getBackupCommitted(addr string) (uint64, error) {
+	conn, cli, err := dial(addr, 800*time.Millisecond)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	defer cancel()
+	pr, err := cli.Ping(ctx, &pb.PingRequest{})
+	if err != nil {
+		return 0, err
+	}
+	if !pr.GetOk() {
+		return 0, fmt.Errorf("ping not ok: %s", pr.GetErr())
+	}
+	return pr.GetMaxCommitted(), nil
+}
+
+// -----------------------------
+// Helpers
+// -----------------------------
+func applyOp(store *ckv.Store, op *pb.Operation) error {
+	switch op.GetType() {
+	case pb.OperationType_OP_PUT:
+		return store.Put(op.GetKey(), op.GetValue())
+	case pb.OperationType_OP_DEL:
+		return store.Del(op.GetKey())
+	default:
+		return fmt.Errorf("bad op type: %v", op.GetType())
+	}
+}
+
+func dial(addr string, timeout time.Duration) (*grpc.ClientConn, pb.StorageNodeClient, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	conn, err := grpc.DialContext(ctx, addr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn, pb.NewStorageNodeClient(conn), nil
+}
+
+func (s *server) replicateOnce(addr string, req *pb.ReplicateRequest) (bool, string) {
+	conn, cli, err := dial(addr, 800*time.Millisecond)
+	if err != nil {
+		return false, err.Error()
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	r, err := cli.Replicate(ctx, req)
+	if err != nil {
+		return false, err.Error()
+	}
+	if !r.GetOk() {
+		return false, r.GetErr()
+	}
+	return true, ""
 }
 
 func main() {
-	var addr, img string
-	var size uint64
-
-	var roleStr string
-	var epoch uint64
-	var backupsStr string
-	var wq int
-	var timeout time.Duration
-	var idemTTL time.Duration
-	var idemLimit int
-
-	flag.StringVar(&addr, "addr", "127.0.0.1:7001", "listen address")
-	flag.StringVar(&img, "img", "node1.img", "disk image")
-	flag.Uint64Var(&size, "size", 64*1024*1024, "device size")
-
-	flag.StringVar(&roleStr, "role", "backup", "role: primary|backup")
-	flag.Uint64Var(&epoch, "epoch", 1, "replica-group epoch")
-	flag.StringVar(&backupsStr, "backups", "", "(primary only) backups, comma-separated")
-	flag.IntVar(&wq, "wq", 2, "write quorum W (include primary)")
-	flag.DurationVar(&timeout, "timeout", 2*time.Second, "rpc timeout")
-	flag.DurationVar(&idemTTL, "idem_ttl", 5*time.Minute, "idempotency ttl")
-	flag.IntVar(&idemLimit, "idem_limit", 200000, "idempotency limit")
+	var (
+		addr    = flag.String("addr", "127.0.0.1:9000", "listen addr")
+		img     = flag.String("img", "./dev.img", "disk engine image path")
+		devSize = flag.Uint64("dev_size", 1<<30, "disk engine image size (bytes)")
+		oplogP  = flag.String("oplog", "./oplog.log", "oplog path")
+	)
 	flag.Parse()
 
-	roleStr = strings.ToLower(strings.TrimSpace(roleStr))
-	role := pb.Role_ROLE_UNSPEC
-	switch roleStr {
-	case "primary":
-		role = pb.Role_ROLE_PRIMARY
-	case "backup":
-		role = pb.Role_ROLE_BACKUP
-	default:
-		log.Fatalf("invalid role: %s", roleStr)
-	}
-	if epoch == 0 {
-		log.Fatalf("epoch must be > 0")
-	}
-
-	store, err := ckv.Open(img, size)
+	st, err := ckv.Open(*img, *devSize)
 	if err != nil {
-		log.Fatalf("kv_open failed: %v", err)
+		log.Fatalf("ckv open: %v", err)
 	}
-	defer store.Close()
+	defer st.Close()
 
-	lis, err := net.Listen("tcp", addr)
+	srv, err := newServer(*addr, st, *oplogP)
 	if err != nil {
-		log.Fatalf("listen failed: %v", err)
+		log.Fatalf("server init: %v", err)
+	}
+	defer srv.ol.Close()
+
+	lis, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatalf("listen: %v", err)
 	}
 
 	gs := grpc.NewServer()
-
-	srv := &server{
-		store:   store,
-		role:    role,
-		epoch:   epoch,
-		seq:     0,
-		backups: splitNonEmpty(backupsStr),
-		wq:      wq,
-		timeout: timeout,
-		pool:    newPool(),
-		idem:    newIdemCache(idemTTL, idemLimit),
-	}
-
 	pb.RegisterStorageNodeServer(gs, srv)
-	reflection.Register(gs)
 
-	log.Printf("storagenode role=%s epoch=%d listen=%s backups=%v wq=%d", roleStr, epoch, addr, srv.backups, wq)
-
-	go gs.Serve(lis)
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-
-	log.Printf("shutdown...")
-	done := make(chan struct{})
-	go func() {
-		gs.GracefulStop()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		gs.Stop()
+	log.Printf("storagenode listening on %s (img=%s size=%d)", *addr, *img, *devSize)
+	if err := gs.Serve(lis); err != nil {
+		log.Fatalf("serve: %v", err)
 	}
-
-	_ = lis.Close()
-	fmt.Println("bye")
-}
-
-func splitNonEmpty(s string) []string {
-	if strings.TrimSpace(s) == "" {
-		return nil
-	}
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
 }

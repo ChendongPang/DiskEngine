@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package coordinator;
+
+option go_package = "dataplane/internal/rpc/pbcoord;pbcoord";
+
+// Single-point coordinator: manages shard epoch and primary selection with CAS.
+message ShardState {
+  uint32 shard = 1;
+  uint64 epoch = 2;
+  string primary = 3;
+  repeated string backups = 4;
+  uint32 wq = 5;
+}
+
+message GetStateRequest { uint32 shard = 1; }
+message GetStateReply { bool ok = 1; string err = 2; ShardState state = 3; }
+
+message CasFailoverRequest {
+  uint32 shard = 1;
+  uint64 expected_epoch = 2;
+
+  // chosen new primary/backups (gateway chooses based on max_committed)
+  string new_primary = 3;
+  repeated string new_backups = 4;
+  uint32 wq = 5;
+}
+
+message CasFailoverReply {
+  bool ok = 1;
+  string err = 2;
+  ShardState state = 3; // updated state if ok, current state if failed
+}
+
+message BootstrapRequest {
+  uint32 shard = 1;
+  uint64 epoch = 2;
+  string primary = 3;
+  repeated string backups = 4;
+  uint32 wq = 5;
+}
+message BootstrapReply { bool ok = 1; string err = 2; }
+
+service Coordinator {
+  rpc GetState(GetStateRequest) returns (GetStateReply);
+  rpc CasFailover(CasFailoverRequest) returns (CasFailoverReply);
+  rpc Bootstrap(BootstrapRequest) returns (BootstrapReply);
+}

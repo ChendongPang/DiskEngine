@@ -19,29 +19,28 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	StorageNode_Put_FullMethodName         = "/dataplane.v1.StorageNode/Put"
-	StorageNode_Get_FullMethodName         = "/dataplane.v1.StorageNode/Get"
-	StorageNode_Del_FullMethodName         = "/dataplane.v1.StorageNode/Del"
-	StorageNode_Ping_FullMethodName        = "/dataplane.v1.StorageNode/Ping"
-	StorageNode_ClientWrite_FullMethodName = "/dataplane.v1.StorageNode/ClientWrite"
-	StorageNode_Replicate_FullMethodName   = "/dataplane.v1.StorageNode/Replicate"
-	StorageNode_Configure_FullMethodName   = "/dataplane.v1.StorageNode/Configure"
+	StorageNode_Put_FullMethodName         = "/storagenode.StorageNode/Put"
+	StorageNode_Get_FullMethodName         = "/storagenode.StorageNode/Get"
+	StorageNode_Del_FullMethodName         = "/storagenode.StorageNode/Del"
+	StorageNode_Ping_FullMethodName        = "/storagenode.StorageNode/Ping"
+	StorageNode_Configure_FullMethodName   = "/storagenode.StorageNode/Configure"
+	StorageNode_ClientWrite_FullMethodName = "/storagenode.StorageNode/ClientWrite"
+	StorageNode_Replicate_FullMethodName   = "/storagenode.StorageNode/Replicate"
 )
 
 // StorageNodeClient is the client API for StorageNode service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type StorageNodeClient interface {
-	// Public API (client->gateway uses these)
+	// External
 	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutReply, error)
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetReply, error)
 	Del(ctx context.Context, in *DelRequest, opts ...grpc.CallOption) (*DelReply, error)
 	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingReply, error)
-	// Internal data-plane
+	// Internal
+	Configure(ctx context.Context, in *ConfigureRequest, opts ...grpc.CallOption) (*ConfigureReply, error)
 	ClientWrite(ctx context.Context, in *ClientWriteRequest, opts ...grpc.CallOption) (*ClientWriteReply, error)
 	Replicate(ctx context.Context, in *ReplicateRequest, opts ...grpc.CallOption) (*ReplicateReply, error)
-	// Control-plane lite
-	Configure(ctx context.Context, in *ConfigureRequest, opts ...grpc.CallOption) (*ConfigureReply, error)
 }
 
 type storageNodeClient struct {
@@ -88,6 +87,15 @@ func (c *storageNodeClient) Ping(ctx context.Context, in *PingRequest, opts ...g
 	return out, nil
 }
 
+func (c *storageNodeClient) Configure(ctx context.Context, in *ConfigureRequest, opts ...grpc.CallOption) (*ConfigureReply, error) {
+	out := new(ConfigureReply)
+	err := c.cc.Invoke(ctx, StorageNode_Configure_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *storageNodeClient) ClientWrite(ctx context.Context, in *ClientWriteRequest, opts ...grpc.CallOption) (*ClientWriteReply, error) {
 	out := new(ClientWriteReply)
 	err := c.cc.Invoke(ctx, StorageNode_ClientWrite_FullMethodName, in, out, opts...)
@@ -106,29 +114,19 @@ func (c *storageNodeClient) Replicate(ctx context.Context, in *ReplicateRequest,
 	return out, nil
 }
 
-func (c *storageNodeClient) Configure(ctx context.Context, in *ConfigureRequest, opts ...grpc.CallOption) (*ConfigureReply, error) {
-	out := new(ConfigureReply)
-	err := c.cc.Invoke(ctx, StorageNode_Configure_FullMethodName, in, out, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // StorageNodeServer is the server API for StorageNode service.
 // All implementations must embed UnimplementedStorageNodeServer
 // for forward compatibility
 type StorageNodeServer interface {
-	// Public API (client->gateway uses these)
+	// External
 	Put(context.Context, *PutRequest) (*PutReply, error)
 	Get(context.Context, *GetRequest) (*GetReply, error)
 	Del(context.Context, *DelRequest) (*DelReply, error)
 	Ping(context.Context, *PingRequest) (*PingReply, error)
-	// Internal data-plane
+	// Internal
+	Configure(context.Context, *ConfigureRequest) (*ConfigureReply, error)
 	ClientWrite(context.Context, *ClientWriteRequest) (*ClientWriteReply, error)
 	Replicate(context.Context, *ReplicateRequest) (*ReplicateReply, error)
-	// Control-plane lite
-	Configure(context.Context, *ConfigureRequest) (*ConfigureReply, error)
 	mustEmbedUnimplementedStorageNodeServer()
 }
 
@@ -148,14 +146,14 @@ func (UnimplementedStorageNodeServer) Del(context.Context, *DelRequest) (*DelRep
 func (UnimplementedStorageNodeServer) Ping(context.Context, *PingRequest) (*PingReply, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Ping not implemented")
 }
+func (UnimplementedStorageNodeServer) Configure(context.Context, *ConfigureRequest) (*ConfigureReply, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Configure not implemented")
+}
 func (UnimplementedStorageNodeServer) ClientWrite(context.Context, *ClientWriteRequest) (*ClientWriteReply, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ClientWrite not implemented")
 }
 func (UnimplementedStorageNodeServer) Replicate(context.Context, *ReplicateRequest) (*ReplicateReply, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Replicate not implemented")
-}
-func (UnimplementedStorageNodeServer) Configure(context.Context, *ConfigureRequest) (*ConfigureReply, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method Configure not implemented")
 }
 func (UnimplementedStorageNodeServer) mustEmbedUnimplementedStorageNodeServer() {}
 
@@ -242,6 +240,24 @@ func _StorageNode_Ping_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _StorageNode_Configure_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ConfigureRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StorageNodeServer).Configure(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StorageNode_Configure_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StorageNodeServer).Configure(ctx, req.(*ConfigureRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _StorageNode_ClientWrite_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ClientWriteRequest)
 	if err := dec(in); err != nil {
@@ -278,29 +294,11 @@ func _StorageNode_Replicate_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
-func _StorageNode_Configure_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ConfigureRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(StorageNodeServer).Configure(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: StorageNode_Configure_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(StorageNodeServer).Configure(ctx, req.(*ConfigureRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 // StorageNode_ServiceDesc is the grpc.ServiceDesc for StorageNode service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var StorageNode_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "dataplane.v1.StorageNode",
+	ServiceName: "storagenode.StorageNode",
 	HandlerType: (*StorageNodeServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
@@ -320,16 +318,16 @@ var StorageNode_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _StorageNode_Ping_Handler,
 		},
 		{
+			MethodName: "Configure",
+			Handler:    _StorageNode_Configure_Handler,
+		},
+		{
 			MethodName: "ClientWrite",
 			Handler:    _StorageNode_ClientWrite_Handler,
 		},
 		{
 			MethodName: "Replicate",
 			Handler:    _StorageNode_Replicate_Handler,
-		},
-		{
-			MethodName: "Configure",
-			Handler:    _StorageNode_Configure_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

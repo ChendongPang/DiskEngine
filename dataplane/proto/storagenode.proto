@@ -1,32 +1,48 @@
 syntax = "proto3";
 
-package dataplane.v1;
+package storagenode;
 
 option go_package = "dataplane/internal/rpc/pb;pb";
 
-service StorageNode {
-  // Public API (client->gateway uses these)
-  rpc Put  (PutRequest) returns (PutReply);
-  rpc Get  (GetRequest) returns (GetReply);
-  rpc Del  (DelRequest) returns (DelReply);
-  rpc Ping (PingRequest) returns (PingReply);
-
-  // Internal data-plane
-  rpc ClientWrite (ClientWriteRequest) returns (ClientWriteReply); // gateway -> primary
-  rpc Replicate   (ReplicateRequest)   returns (ReplicateReply);   // primary -> backup
-
-  // Control-plane lite
-  rpc Configure (ConfigureRequest) returns (ConfigureReply);       // gateway -> node
+// -----------------------------------------
+// Common
+// -----------------------------------------
+enum NodeRole {
+  ROLE_UNKNOWN = 0;
+  ROLE_PRIMARY = 1;
+  ROLE_BACKUP  = 2;
 }
 
+enum OperationType {
+  OP_UNKNOWN = 0;
+  OP_PUT     = 1;
+  OP_DEL     = 2;
+}
+
+message Operation {
+  OperationType type = 1;
+  string key = 2;
+  bytes value = 3; // for PUT; empty for DEL
+}
+
+// Replication phase: explicit PREPARE/COMMIT (no req_id ":commit" hack).
+enum ReplicationPhase {
+  PHASE_UNKNOWN = 0;
+  PHASE_PREPARE = 1;
+  PHASE_COMMIT  = 2;
+}
+
+// -----------------------------------------
+// External API (client/gateway)
+// -----------------------------------------
 message PutRequest {
   string key = 1;
-  bytes  value = 2;
+  bytes value = 2;
 }
 
 message PutReply {
   bool ok = 1;
-  string error = 2;
+  string err = 2;
 }
 
 message GetRequest {
@@ -34,9 +50,10 @@ message GetRequest {
 }
 
 message GetReply {
-  bool found = 1;
-  bytes value = 2;
-  string error = 3;
+  bool ok = 1;
+  string err = 2;
+  bool found = 3;
+  bytes value = 4;
 }
 
 message DelRequest {
@@ -45,66 +62,78 @@ message DelRequest {
 
 message DelReply {
   bool ok = 1;
-  string error = 2;
+  string err = 2;
 }
 
-message PingRequest {}
+// Ping used for liveness & selecting best failover candidate.
+// Also returns committed watermarks for choosing newest backup.
+message PingRequest {
+}
 
 message PingReply {
   bool ok = 1;
+  string err = 2;
+
+  NodeRole role = 3;
+  uint64 epoch = 4;
+  uint64 max_committed = 5;
 }
 
-// ---------- replication ----------
-
-enum Op {
-  OP_UNSPEC = 0;
-  OP_PUT = 1;
-  OP_DEL = 2;
-}
-
-message WriteEntry {
-  string key = 1;
-  bytes  value = 2;
-  Op     op = 3;
-
-  uint64 epoch = 4;   // fencing: must match current epoch
-  uint64 seq = 5;     // assigned by primary (monotonic per node)
-  string req_id = 6;  // idempotency token
-}
-
-message ClientWriteRequest {
-  WriteEntry entry = 1;
-}
-
-message ClientWriteReply {
-  bool ok = 1;
-  string error = 2;
-  uint64 seq = 3;
-}
-
-message ReplicateRequest {
-  WriteEntry entry = 1;
-}
-
-message ReplicateReply {
-  bool ok = 1;
-  string error = 2;
-}
-
-enum Role {
-  ROLE_UNSPEC = 0;
-  ROLE_PRIMARY = 1;
-  ROLE_BACKUP = 2;
-}
-
+// -----------------------------------------
+// Internal API (gateway -> node, primary -> backup)
+// -----------------------------------------
 message ConfigureRequest {
-  Role role = 1;
-  uint64 epoch = 2;
-  repeated string backups = 3; // only meaningful on primary
-  uint32 wq = 4;              // W quorum (include primary)
+  uint64 epoch = 1;
+  NodeRole role = 2;
+
+  // Cluster view for this shard.
+  string primary_addr = 3;
+  repeated string backup_addrs = 4;
+
+  // Write quorum (wq) for client ack.
+  // MVP: used to require prepare acks from backups (wq-1).
+  uint32 wq = 5;
 }
 
 message ConfigureReply {
   bool ok = 1;
-  string error = 2;
+  string err = 2;
+}
+
+message ClientWriteRequest {
+  uint64 epoch = 1;
+  string req_id = 2;
+  Operation op = 3;
+}
+
+message ClientWriteReply {
+  bool ok = 1;
+  string err = 2;
+}
+
+message ReplicateRequest {
+  uint64 epoch = 1;
+  ReplicationPhase phase = 2;
+  Operation op = 3;
+  string req_id = 4; // still used for idempotency / tracing
+  uint64 seq = 5;    // primary assigned seq
+}
+
+message ReplicateReply {
+  bool ok = 1;
+  string err = 2;
+  uint64 max_committed = 3;
+}
+
+service StorageNode {
+  // External
+  rpc Put(PutRequest) returns (PutReply);
+  rpc Get(GetRequest) returns (GetReply);
+  rpc Del(DelRequest) returns (DelReply);
+  rpc Ping(PingRequest) returns (PingReply);
+
+  // Internal
+  rpc Configure(ConfigureRequest) returns (ConfigureReply);
+  rpc ClientWrite(ClientWriteRequest) returns (ClientWriteReply);
+  rpc Replicate(ReplicateRequest) returns (ReplicateReply);
 }

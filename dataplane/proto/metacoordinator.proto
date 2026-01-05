@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package metacoordinator;
+
+option go_package = "dataplane/internal/rpc/pbmeta;pbmeta";
+
+// Stable source of truth for shard epoch + primary/backups view.
+// MVP: single process, in-memory state, CAS on epoch.
+
+message ShardView {
+  uint32 shard = 1;
+  uint64 epoch = 2;
+  string primary_addr = 3;
+  repeated string backup_addrs = 4;
+  uint32 wq = 5;
+}
+
+message GetViewRequest { uint32 shard = 1; }
+message GetViewReply { bool ok = 1; string err = 2; ShardView view = 3; }
+
+message BootstrapRequest { ShardView view = 1; }
+message BootstrapReply { bool ok = 1; string err = 2; }
+
+message CasFailoverRequest {
+  uint32 shard = 1;
+  uint64 expected_epoch = 2;
+  string new_primary_addr = 3;
+  repeated string new_backup_addrs = 4;
+  uint32 wq = 5;
+}
+
+message CasFailoverReply { bool ok = 1; string err = 2; ShardView view = 3; }
+
+service MetaCoordinator {
+  rpc GetView(GetViewRequest) returns (GetViewReply);
+  rpc Bootstrap(BootstrapRequest) returns (BootstrapReply);
+  rpc CasFailover(CasFailoverRequest) returns (CasFailoverReply);
+}

@@ -12,63 +12,14 @@ import (
 	"time"
 
 	"dataplane/internal/gateway"
-	"dataplane/internal/rpc/pb"
+	pb "dataplane/internal/rpc/pb"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/reflection"
 )
 
-func main() {
-	var addr string
-	var primary string
-	var backupsStr string
-	var epoch uint64
-	var wq uint
-	var timeout time.Duration
-	var bootstrap bool
-
-	flag.StringVar(&addr, "addr", "127.0.0.1:8000", "gateway listen address")
-	flag.StringVar(&primary, "primary", "127.0.0.1:7001", "primary storagenode")
-	flag.StringVar(&backupsStr, "backups", "127.0.0.1:7002,127.0.0.1:7003", "backup storagenodes")
-	flag.Uint64Var(&epoch, "epoch", 1, "initial epoch")
-	flag.UintVar(&wq, "wq", 2, "write quorum W (include primary)")
-	flag.DurationVar(&timeout, "timeout", 2*time.Second, "rpc timeout")
-	flag.BoolVar(&bootstrap, "bootstrap", true, "push initial config to nodes")
-	flag.Parse()
-
-	backups := splitNonEmpty(backupsStr)
-
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatalf("listen failed: %v", err)
-	}
-
-	srv := gateway.NewServer(primary, backups, epoch, uint32(wq), timeout)
-	if bootstrap {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		_ = srv.Bootstrap(ctx) // best effort
-		cancel()
-	}
-
-	gs := grpc.NewServer()
-	pb.RegisterStorageNodeServer(gs, srv)
-	reflection.Register(gs)
-
-	log.Printf("gateway listening on %s primary=%s backups=%v epoch=%d wq=%d", addr, primary, backups, epoch, wq)
-
-	go gs.Serve(lis)
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-
-	log.Printf("shutdown...")
-	gs.GracefulStop()
-	_ = lis.Close()
-}
-
 func splitNonEmpty(s string) []string {
-	if strings.TrimSpace(s) == "" {
+	s = strings.TrimSpace(s)
+	if s == "" {
 		return nil
 	}
 	parts := strings.Split(s, ",")
@@ -80,4 +31,72 @@ func splitNonEmpty(s string) []string {
 		}
 	}
 	return out
+}
+
+func main() {
+	var (
+		addr       string
+		metaAddr   string
+		numShards  int
+		primary    string
+		backupsStr string
+		epoch      uint64
+		wq         uint
+		timeout    time.Duration
+		bootstrap  bool
+	)
+
+	flag.StringVar(&addr, "addr", "127.0.0.1:8000", "gateway listen addr")
+	flag.StringVar(&metaAddr, "meta", "127.0.0.1:9100", "meta-coordinator addr")
+	flag.IntVar(&numShards, "shards", 1, "number of shards")
+	flag.StringVar(&primary, "primary", "", "initial primary addr (for bootstrap)")
+	flag.StringVar(&backupsStr, "backups", "", "initial backups addrs, comma-separated (for bootstrap)")
+	flag.Uint64Var(&epoch, "epoch", 1, "initial epoch (for bootstrap)")
+	flag.UintVar(&wq, "wq", 2, "write quorum W (include primary)")
+	flag.DurationVar(&timeout, "timeout", 2*time.Second, "rpc timeout")
+	flag.BoolVar(&bootstrap, "bootstrap", true, "bootstrap meta-coordinator")
+	flag.Parse()
+
+	backups := splitNonEmpty(backupsStr)
+
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("listen failed: %v", err)
+	}
+
+	srv := gateway.NewServer(numShards, metaAddr, timeout)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if bootstrap {
+		if primary == "" {
+			log.Fatalf("-primary required when -bootstrap=true")
+		}
+		for sh := 0; sh < numShards; sh++ {
+			if err := srv.BootstrapShard(ctx, sh, epoch, primary, backups, uint32(wq)); err != nil {
+				log.Fatalf("bootstrap shard %d: %v", sh, err)
+			}
+		}
+	} else {
+		if err := srv.RefreshAll(ctx); err != nil {
+			log.Printf("refresh all from meta: %v", err)
+		}
+	}
+
+	gs := grpc.NewServer()
+	pb.RegisterStorageNodeServer(gs, srv)
+
+	go func() {
+		log.Printf("gateway listening on %s (meta=%s shards=%d)", addr, metaAddr, numShards)
+		if err := gs.Serve(lis); err != nil {
+			log.Fatalf("serve failed: %v", err)
+		}
+	}()
+
+	sigC := make(chan os.Signal, 1)
+	signal.Notify(sigC, syscall.SIGINT, syscall.SIGTERM)
+	<-sigC
+	log.Printf("gateway shutting down")
+	gs.GracefulStop()
 }
