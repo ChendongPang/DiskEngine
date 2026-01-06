@@ -379,6 +379,8 @@ func (s *Server) writeInternal(ctx context.Context, op *pb.Operation, kind strin
 	if v.Primary != "" {
 		if ok, errStr := s.clientWriteOnce(ctx, v.Primary, v.Epoch, reqID, op); ok {
 			return true, ""
+		} else {
+			log.Printf("[gw] %s primary failed shard=%d primary=%s err=%s", kind, sh, v.Primary, errStr)
 		}
 	}
 

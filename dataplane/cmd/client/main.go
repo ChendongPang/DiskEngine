@@ -79,7 +79,7 @@ func main() {
 			log.Fatalf("put failed: %v", err)
 		}
 		if !resp.Ok {
-			log.Fatalf("put error: %s", resp.Error)
+			log.Fatalf("put error: %s", resp.Err)
 		}
 		fmt.Println("put ok")
 
@@ -114,7 +114,7 @@ func main() {
 			log.Fatalf("del failed: %v", err)
 		}
 		if !resp.Ok {
-			log.Fatalf("del error: %s", resp.Error)
+			log.Fatalf("del error: %s", resp.Err)
 		}
 		fmt.Println("del ok")
 

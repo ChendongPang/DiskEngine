@@ -7,11 +7,6 @@ build/
 *.oplog
 *.log
 
-# binaries
-client
-gateway
-storagenode
-metacoordinator
 
 # editor / misc
 *.swp

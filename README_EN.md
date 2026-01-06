@@ -102,6 +102,7 @@ cmake --build build -j
 
 ```bash
 cd dataplane
+bash scripts/gen_proto.sh
 go build ./cmd/metacoordinator
 go build ./cmd/gateway
 go build ./cmd/storagenode
@@ -118,7 +119,7 @@ cd dataplane
 ### 4. Verify
 
 ```bash
-./client -addr 127.0.0.1:9200 put k1 v1
-./client -addr 127.0.0.1:9200 get k1
-./client -addr 127.0.0.1:9200 del k1
+./client -addr 127.0.0.1:8000 put k1 v1
+./client -addr 127.0.0.1:8000 get k1
+./client -addr 127.0.0.1:8000 del k1
 ```
