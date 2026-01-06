@@ -1,172 +1,252 @@
-# DiskEngine —— 磁盘结构与数据路径说明
-
-DiskEngine 是一个**最小但完整的磁盘引擎（Disk Engine）实现**，
-采用 **allocator-first + WAL（Write-Ahead Logging）** 的设计，
-提供 **可恢复（crash-consistent）** 的数据写入与读取能力。
-
-本 README 仅描述**当前已经实现的事实**，不包含未来规划或扩展设计。
+# DiskEngine + Dataplane  
+*A runnable distributed storage prototype with a real disk engine*
 
 ---
 
-## 1. 整体设计概览
+## 项目整体说明
 
-DiskEngine 的核心目标是：
+本项目是一个**已经可以运行的分布式存储系统原型（MVP）**，由两个**职责严格划分、但协同工作的模块**组成：
 
-- 将 **payload 数据** 安全写入磁盘
-- 通过 **WAL** 保证崩溃后一致性恢复
-- 明确区分 **数据存储（Data Region）** 与 **元数据日志（WAL）**
-- 保持结构简单、语义可推导
+- **Disk Engine（C）**  
+  一个单机持久化内核，负责**磁盘布局、WAL、allocator、crash recovery**  
+- **Dataplane（Go）**  
+  一个网络数据平面，负责**RPC、进程解耦与请求路径编排**
 
-DiskEngine **不是文件系统，也不是数据库**，而是一个底层磁盘引擎。
+两者共同组成一个**完整的数据闭环系统**：  
+**Client → 网络 → 进程 → 磁盘 → crash → 恢复**
 
----
-
-## 2. 磁盘物理结构（On-Disk Layout）
-
-DiskEngine 使用 **单一磁盘文件 / block device（一个 fd）**，
-通过 **固定 offset 划分磁盘区域**，在物理层面分离不同职责。
-
-### 2.1 整体磁盘布局
-
-```
-Disk / File (fd)
-offset →
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ Superblock A │ Superblock B │              WAL Region              │  Data   │
-│     4KB      │     4KB      │          wal_len (固定大小)           │ Region  │
-├──────────────┴──────────────┴─────────────────────────────────────┴──────────┤
-0              4K             8K                                data_off
-```
-
-关键字段（存储在 superblock 中）：
-
-```
-sb.wal_off   = 2 * 4KB
-sb.wal_len   = 固定大小（例如 4MB）
-sb.data_off  = sb.wal_off + sb.wal_len
-sb.data_len  = 设备大小 - sb.data_off
-```
-
-**WAL 与 Data 在物理上通过 offset 严格分离，不可能发生重叠。**
+本 README 同时描述 **Disk Engine 与 Dataplane 的已实现行为**，  
+不包含任何未落地的分布式机制或未来规划。
 
 ---
 
-## 3. Superblock（A/B 双写）
-
-Superblock 采用 **A/B 双写 + epoch + CRC 校验**，用于防止部分写损坏。
+## 整体运行拓扑（事实）
 
 ```
-Superblock Slot A @ offset 0
-┌──────────────────────────────────────────────────────────┐
-│ magic | version | epoch | wal_off | wal_len | data_off   │
-│ data_len | alloc_unit | wal_ckpt_lsn | crc32 | ...       │
-└──────────────────────────────────────────────────────────┘
-
-Superblock Slot B @ offset 4KB
-┌──────────────────────────────────────────────────────────┐
-│ 相同结构，epoch 更新                                      │
-└──────────────────────────────────────────────────────────┘
+Client
+  |
+  | gRPC (Put / Get / Delete)
+  v
+Gateway (stateless)
+  |
+  | gRPC (forward)
+  v
+StorageNode (one process)
+  |
+  | cgo
+  v
+Disk Engine (one instance)
 ```
 
-启动时的选择规则：
-
-```
-选择 crc 校验通过 且 epoch 最大 的 superblock
-```
+- 一个 StorageNode **绑定一个 Disk Engine 实例**
+- Dataplane 与 Disk Engine 之间通过 **明确的 cgo 边界**
+- 当前以**本地多进程**方式运行，便于调试与 crash 验证
 
 ---
 
-## 4. WAL 区域（Write-Ahead Log）
+## Disk Engine（C）
 
-WAL 是一个 **固定大小窗口内的顺序追加日志**，
-只用于 **崩溃恢复（crash recovery）**，不参与正常读路径。
+Disk Engine 是系统的**持久化内核**，负责所有与磁盘一致性相关的工作。
 
-### 4.1 WAL 区域布局
+### 职责范围
 
-```
-WAL Region [wal_off .. wal_off + wal_len)
+Disk Engine **只关心单机持久化正确性**：
 
-wal_off
-  ↓
-  ┌──────────────┬──────────────┬──────────────┬──────────────┐
-  │ WAL Record 1 │ WAL Record 2 │ WAL Record 3 │     ...      │
-  └──────────────┴──────────────┴──────────────┴──────────────┘
-                                              ↑
-                                           wal.write_off
-```
+- 物理空间管理（range allocator）
+- WAL（redo-only）
+- data region（blob / record 布局）
+- crash recovery（WAL replay）
+- 数据完整性校验（CRC）
 
-### 4.2 WAL 记录格式
+Disk Engine **完全不感知**：
 
-```
-┌──────────────────── wal_rec_hdr_t ──────────────────────┐
-│ magic | version | type | header_sz | payload_len         │
-│ lsn | seq | crc32 | record_total_len                      │
-└──────────────────────────────────────────────────────────┘
-┌──────────────────────── payload ─────────────────────────┐
-│ 例如 BLOB_PUT: key + blob_id + data_off + data_len        │
-└──────────────────────────────────────────────────────────┘
-┌──────────── 对齐 padding（可选） ─────────────┐
-```
+- 网络
+- RPC
+- 节点角色
+- 分布式一致性
 
 ---
 
-## 5. Data Region（数据区）
-
-Data Region 是一整块连续空间，由 allocator 统一管理。
+### On-Disk 结构（已实现）
 
 ```
-Data Region [data_off .. data_off + data_len)
-
-data_off
-  ↓
-  ┌────────────────┬───────────────┬────────────────┬──────────────┐
-  │ blob record A  │   free space   │ blob record B  │  free space  │
-  └────────────────┴───────────────┴────────────────┴──────────────┘
++------------------+
+| Superblock       |
++------------------+
+| WAL Region       |  (append-only, redo log)
++------------------+
+| Data Region      |  (blob records)
++------------------+
+| Free Space       |
++------------------+
 ```
 
-### 5.1 Blob Record 物理格式
-
-```
-rec_off
-  ↓
-  ┌────────────── blob_record_hdr_t ───────────────┐
-  │ magic | version | payload_len                  │
-  │ header_crc32 | payload_crc32 | ...              │
-  └────────────────────────────────────────────────┘
-  ┌──────────────────── payload bytes ─────────────┐
-  │ 用户数据                                        │
-  └────────────────────────────────────────────────┘
-```
+- WAL 只描述**逻辑变更**
+- Data Region 保存**最终数据形态**
+- allocator 负责管理 data region 的物理空间
 
 ---
 
-## 6. 数据路径（Data Path）
+### 写入模型与提交点（关键细节）
 
-### 6.1 写路径（disk_engine_put）
+一次 `disk_engine_put(key, value)` 的实际顺序为：
 
 ```
-disk_engine_put(key, data, len)
-│
-│ 1) ra_alloc() → rec_off
-│
-│ 2) 写 payload @ rec_off + header
-│
-│ 3) 写 blob header @ rec_off
-│
-│ 4) fdatasync()        （数据先持久化）
-│
-│ 5) wal_append(BLOB_PUT)
-│
-│ 6) wal_sync()         （提交点）
-│
-│ 7) index[key] = { rec_off, len }
+1. allocator_alloc()
+2. write blob record to data region
+3. fsync(data fd)
+4. wal_append(BLOB_PUT)
+5. wal_sync()   <-- 唯一提交点
+```
+
+**重要不变量：**
+
+- WAL sync 之前的数据 **对外不可见**
+- WAL sync 之后的数据 **必须在 crash 后可恢复**
+
+---
+
+### Crash Recovery 行为（可验证）
+
+- crash 后：
+  - 不扫描 data region
+  - 仅 replay WAL
+- replay 过程中：
+  - 重建 allocator 状态
+  - 重建 key → blob 映射
+- 未 commit 的 data 写入会被自然丢弃
+
+---
+
+### 读路径（已实现）
+
+```
+disk_engine_get(key)
+  -> lookup blob metadata
+  -> read data region
+  -> header CRC + payload CRC 校验
+```
+
+- 读路径 **不依赖 WAL**
+- 正确性完全由 data region + 校验保证
+
+---
+
+## Dataplane（Go）
+
+Dataplane 是 Disk Engine 之上的**最小网络数据平面**，其目标是：
+
+> 把一个 crash-safe 的单机引擎，  
+> 变成一个可以通过网络访问的服务。
+
+---
+
+### Dataplane 目录结构（运行相关）
+
+```
+dataplane/
+├── cmd/
+│   ├── gateway/        # Client 入口
+│   └── storagenode/   # 数据节点
+├── internal/
+│   ├── ckv/            # Disk Engine 的 cgo 封装
+│   └── rpc/pb/         # Gateway <-> StorageNode gRPC
+└── scripts/
 ```
 
 ---
 
-## 7. 核心不变量（Invariants）
+## StorageNode
 
-1. **WAL 与 Data 通过固定 offset 物理隔离**
-2. **payload 永远先于 WAL 提交落盘**
-3. **WAL 是恢复阶段的唯一事实来源**
-4. **稳态读路径不依赖 WAL**
+StorageNode 是 **Disk Engine 的进程化封装**。
+
+### 职责
+
+- 管理一个 Disk Engine 实例的生命周期
+- 将 RPC 请求 **同步映射** 为 disk_engine_* 调用
+- 不缓存、不复制、不合并请求
+
+### 写路径（逐步、与代码对齐）
+
+一次 `Put(key, value)` 的完整执行路径为：
+
+```
+Client
+  -> Gateway.Put
+    -> StorageNode.Put
+      -> ckv.Put
+        -> disk_engine_put
+          -> allocator_alloc
+          -> write data
+          -> fsync
+          -> wal_append
+          -> wal_sync
+```
+
+- crash 语义完全由 Disk Engine 决定
+- StorageNode 不引入任何额外状态
+
+---
+
+## Gateway
+
+Gateway 是 **Client 的唯一入口**。
+
+### 行为事实
+
+- Gateway **不访问磁盘**
+- Gateway **不维护任何数据状态**
+- 当前实现仅做：
+  - gRPC API 暴露
+  - RPC 参数透传
+  - 请求转发
+
+Gateway 的存在意义在于：
+
+- 明确网络边界
+- 将 RPC 复杂性与磁盘复杂性彻底隔离
+
+---
+
+## 系统当前能力边界（工程事实）
+
+### 已实现并可运行
+
+- crash-safe Disk Engine
+- redo-only WAL + replay
+- allocator + blob on-disk layout
+- Gateway / StorageNode / Disk Engine 完整调用链
+- 本地多进程 cluster 启动
+
+### 刻意未实现
+
+- WAL checkpoint / truncate
+- allocator GC
+- 副本复制 / 一致性协议
+- shard / 自动路由
+
+这些能力未实现，是为了保证：
+> **所有已有路径都可单步调试、可 crash 验证。**
+
+---
+
+## 构建与运行
+
+```bash
+rm -rf build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+cd dataplane
+./scripts/run_cluster.sh start
+```
+
+---
+
+## 项目总结
+
+这是一个**以 Disk Engine 为核心、由 Dataplane 组成完整系统的存储原型**：
+
+- Disk Engine 解决“最难做对的事”：持久化与 crash consistency
+- Dataplane 解决“最容易被写乱的事”：边界与调用路径
+- 两者组合，形成一个真实可运行的分布式存储最小形态
