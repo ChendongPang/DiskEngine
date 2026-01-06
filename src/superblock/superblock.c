@@ -83,8 +83,8 @@ bool sb_read_best(int fd, superblock_t* out) {
   int rb = sb_pread(fd, SB_SLOT1_OFF, &b);
 
   // If read fails, treat as invalid slot (but if both fail, return false).
-  int va = (ra == 0) ? sb_is_valid(&a) : 0;
-  int vb = (rb == 0) ? sb_is_valid(&b) : 0;
+  int va = (ra == 0) ? sb_is_valid(&a) : -1;
+  int vb = (rb == 0) ? sb_is_valid(&b) : -1;
 
   if (va != 0 && vb != 0)
     return false;
