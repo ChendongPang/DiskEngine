@@ -5,13 +5,23 @@
 
 #include "wal_format.h"
 #include "../superblock/superblock.h"
+#include "../io/io_backend.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct wal_t {
-  int      fd;
+  /* backend: either POSIX fd or SPDK io_backend */
+  int          fd;   /* legacy path (fd >= 0) */
+  io_backend_t *io;  /* SPDK path (io != NULL) */
+
+  /*
+   * Record alignment for this WAL instance.
+   * - POSIX path: WAL_REC_ALIGN (8)
+   * - SPDK path : max(WAL_REC_ALIGN, io_block_size)
+   */
+  uint32_t rec_align;
 
   uint64_t wal_off;     // from superblock
   uint64_t wal_len;     // from superblock
@@ -31,6 +41,10 @@ typedef int (*wal_apply_fn)(uint16_t type,
 // Open WAL and locate append position by scanning from start_lsn.
 // start_lsn: usually sb->wal_ckpt_lsn (MVP can pass 0 to scan from wal_off).
 int wal_open(int fd, const superblock_t* sb, uint64_t start_lsn, wal_t* out);
+
+// Open WAL on top of SPDK io_backend.
+// NOTE: must be called on the SPDK owner thread of the io_backend.
+int wal_open_io(io_backend_t *io, const superblock_t* sb, uint64_t start_lsn, wal_t* out);
 
 // Append one record. Returns 0 and fills out_lsn/out_seq on success.
 int wal_append(wal_t* wal, uint16_t type, const void* payload, uint32_t payload_len,

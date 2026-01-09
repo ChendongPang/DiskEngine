@@ -1,3 +1,4 @@
+// ===== file: src/engine/disk_engine.c =====
 #include "disk_engine.h"
 
 #include "../superblock/superblock.h"
@@ -7,6 +8,7 @@
 #include "../blob/blob_index.h"
 #include "../blob/blob_record.h"
 #include "../common/crc32_ieee.h"
+#include "../io/io_backend.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +22,8 @@
 struct disk_engine_t {
     int fd;
     superblock_t sb;
+
+    io_backend_t *io; /* optional SPDK backend for WAL+data */
 
     range_alloc_t alloc;
     wal_t wal;
@@ -228,6 +232,8 @@ int disk_engine_open(disk_engine_t **out, const char *path, uint64_t dev_size)
     disk_engine_t *e = (disk_engine_t*)calloc(1, sizeof(*e));
     if (!e) return -ENOMEM;
 
+    e->io = NULL;
+
     e->fd = open(path, O_RDWR | O_CREAT, 0644);
     if (e->fd < 0) { free(e); return -errno; }
 
@@ -265,6 +271,83 @@ int disk_engine_open(disk_engine_t **out, const char *path, uint64_t dev_size)
     return 0;
 }
 
+int disk_engine_open_spdk(disk_engine_t **out, const char *sb_path, const char *bdev_name, uint64_t dev_size)
+{
+    if (!out || !sb_path || !bdev_name) return -EINVAL;
+
+    disk_engine_t *e = (disk_engine_t*)calloc(1, sizeof(*e));
+    if (!e) return -ENOMEM;
+
+    e->io = NULL;
+
+    /* Superblock still uses POSIX fd for MVP/demo. */
+    e->fd = open(sb_path, O_RDWR | O_CREAT, 0644);
+    if (e->fd < 0) { free(e); return -errno; }
+
+    int r = ensure_size(e->fd, dev_size);
+    if (r != 0) { close(e->fd); free(e); return r; }
+
+    r = format_if_needed(e->fd, dev_size, &e->sb);
+    if (r != 0) { close(e->fd); free(e); return r; }
+
+    /* Init SPDK backend (must be inside SPDK thread context). */
+    r = io_init(&e->io, bdev_name);
+    if (r != 0) { close(e->fd); free(e); return r; }
+
+    /* Enforce allocator/data alignment compatible with SPDK block I/O. */
+    uint32_t blk = io_block_size(e->io);
+    if (blk == 0 || (e->sb.alloc_unit % blk) != 0) {
+        io_shutdown(e->io);
+        close(e->fd);
+        free(e);
+        return -EINVAL;
+    }
+
+    /* Open WAL via SPDK */
+    r = wal_open_io(e->io, &e->sb, e->sb.wal_ckpt_lsn, &e->wal);
+    if (r != 0) {
+        io_shutdown(e->io);
+        close(e->fd);
+        free(e);
+        return r;
+    }
+
+    /* Init allocator over data region */
+    r = ra_init(&e->alloc, e->sb.data_off, e->sb.data_len);
+    if (r != 0) {
+        io_shutdown(e->io);
+        close(e->fd);
+        free(e);
+        return r;
+    }
+
+    e->idx = blob_index_create();
+    if (!e->idx) {
+        ra_destroy(&e->alloc);
+        io_shutdown(e->io);
+        close(e->fd);
+        free(e);
+        return -ENOMEM;
+    }
+    e->next_blob_id = 1;
+
+    /* Replay WAL to rebuild allocator + blob index */
+    replay_ctx_t ctx = { .e = e };
+    uint64_t last_lsn = 0, last_seq = 0;
+    r = wal_replay(&e->wal, e->sb.wal_ckpt_lsn, wal_apply_engine, &ctx, &last_lsn, &last_seq);
+    if (r != 0) {
+        blob_index_destroy(e->idx);
+        ra_destroy(&e->alloc);
+        io_shutdown(e->io);
+        close(e->fd);
+        free(e);
+        return r;
+    }
+
+    *out = e;
+    return 0;
+}
+
 void disk_engine_close(disk_engine_t *e)
 {
     if (!e) return;
@@ -275,6 +358,11 @@ void disk_engine_close(disk_engine_t *e)
     }
     ra_destroy(&e->alloc);
     // wal_close is no-op
+
+    if (e->io) {
+        io_shutdown(e->io);
+        e->io = NULL;
+    }
     close(e->fd);
     free(e);
 }
@@ -290,27 +378,59 @@ static int write_blob_record(disk_engine_t *e, const void *data, uint32_t len,
     int r = ra_alloc(&e->alloc, total, &rec_off);
     if (r != 0) return r;
 
-    // 1) payload first
-    r = pwrite_full(e->fd, data, len, rec_off + (uint64_t)sizeof(blob_record_hdr_t));
-    if (r != 0) {
-        (void)ra_free(&e->alloc, rec_off, total);
-        return r;
-    }
+    if (e->io) {
+        /*
+         * SPDK strict I/O: off/len must be block-aligned and buffers DMA-safe.
+         * We write the whole allocation [hdr + payload + pad zeros] in one shot.
+         */
+        void *buf = io_dma_alloc(e->io, (size_t)total);
+        if (!buf) {
+            (void)ra_free(&e->alloc, rec_off, total);
+            return -ENOMEM;
+        }
+        memset(buf, 0, (size_t)total);
 
-    // 2) header last
-    blob_record_hdr_t h;
-    blob_record_build_header(&h, data, len);
-    r = pwrite_full(e->fd, &h, sizeof(h), rec_off);
-    if (r != 0) {
-        (void)ra_free(&e->alloc, rec_off, total);
-        return r;
-    }
+        blob_record_hdr_t h;
+        blob_record_build_header(&h, data, len);
+        memcpy((uint8_t*)buf, &h, sizeof(h));
+        memcpy((uint8_t*)buf + sizeof(blob_record_hdr_t), data, (size_t)len);
 
-    // 3) make blob durable before logging metadata (redo-style)
-    if (fdatasync(e->fd) != 0) {
-        int err = -errno;
-        (void)ra_free(&e->alloc, rec_off, total);
-        return err;
+        r = io_write(e->io, rec_off, buf, (uint32_t)total);
+        io_dma_free(e->io, buf);
+        if (r != 0) {
+            (void)ra_free(&e->alloc, rec_off, total);
+            return r;
+        }
+
+        /* make blob durable before logging metadata (redo-style) */
+        r = io_flush(e->io);
+        if (r != 0) {
+            (void)ra_free(&e->alloc, rec_off, total);
+            return r;
+        }
+    } else {
+        // 1) payload first
+        r = pwrite_full(e->fd, data, len, rec_off + (uint64_t)sizeof(blob_record_hdr_t));
+        if (r != 0) {
+            (void)ra_free(&e->alloc, rec_off, total);
+            return r;
+        }
+
+        // 2) header last
+        blob_record_hdr_t h;
+        blob_record_build_header(&h, data, len);
+        r = pwrite_full(e->fd, &h, sizeof(h), rec_off);
+        if (r != 0) {
+            (void)ra_free(&e->alloc, rec_off, total);
+            return r;
+        }
+
+        // 3) make blob durable before logging metadata (redo-style)
+        if (fdatasync(e->fd) != 0) {
+            int err = -errno;
+            (void)ra_free(&e->alloc, rec_off, total);
+            return err;
+        }
     }
 
     *out_rec_off = rec_off;
@@ -346,7 +466,7 @@ int disk_engine_put(disk_engine_t *e, const char *key, const void *data, size_t 
 
     r = wal_append(&e->wal, WAL_REC_BLOB_PUT, &bp, (uint32_t)sizeof(bp), NULL, NULL);
     if (r != 0) {
-        // The blob is durable (fdatasync) but unreferenced; roll back allocator in memory.
+        // The blob is durable (fdatasync/io_flush) but unreferenced; roll back allocator in memory.
         (void)ra_free(&e->alloc, rec_off, alloc_len);
         return r;
     }
@@ -389,7 +509,6 @@ int disk_engine_put(disk_engine_t *e, const char *key, const void *data, size_t 
     return blob_index_put(e->idx, key, &loc);
 }
 
-
 int disk_engine_checkpoint(disk_engine_t *e)
 {
     if (!e) return -EINVAL;
@@ -423,7 +542,42 @@ int disk_engine_get(disk_engine_t *e, const char *key, void **out_buf, size_t *o
 
     if (loc.len == 0 || loc.len > (1ull << 31)) return -EINVAL;
 
-    // Read + verify header
+    if (e->io) {
+        /* Read the whole allocated record in one aligned IO, then verify. */
+        if (loc.alloc_len == 0) return -EINVAL;
+
+        void *rec = io_dma_alloc(e->io, (size_t)loc.alloc_len);
+        if (!rec) return -ENOMEM;
+
+        r = io_read(e->io, loc.off, rec, (uint32_t)loc.alloc_len);
+        if (r != 0) { io_dma_free(e->io, rec); return r; }
+
+        blob_record_hdr_t h;
+        memcpy(&h, rec, sizeof(h));
+
+        if (h.magic != BLOB_REC_MAGIC || h.version != 1) { io_dma_free(e->io, rec); return -EIO; }
+        if (h.payload_len != (uint32_t)loc.len) { io_dma_free(e->io, rec); return -EIO; }
+
+        blob_record_hdr_t tmp = h;
+        tmp.header_crc32 = 0;
+        if (crc32_ieee(&tmp, sizeof(tmp)) != h.header_crc32) { io_dma_free(e->io, rec); return -EIO; }
+
+        void *buf = malloc((size_t)loc.len);
+        if (!buf) { io_dma_free(e->io, rec); return -ENOMEM; }
+        memcpy(buf, (uint8_t*)rec + sizeof(blob_record_hdr_t), (size_t)loc.len);
+        io_dma_free(e->io, rec);
+
+        if (crc32_ieee(buf, (size_t)loc.len) != h.payload_crc32) {
+            free(buf);
+            return -EIO;
+        }
+
+        *out_buf = buf;
+        *out_len = (size_t)loc.len;
+        return 0;
+    }
+
+    /* POSIX path */
     blob_record_hdr_t h;
     r = pread_full(e->fd, &h, sizeof(h), loc.off);
     if (r != 0) return r;
@@ -431,7 +585,6 @@ int disk_engine_get(disk_engine_t *e, const char *key, void **out_buf, size_t *o
     if (h.magic != BLOB_REC_MAGIC || h.version != 1) return -EIO;
     if (h.payload_len != (uint32_t)loc.len) return -EIO;
 
-    // Verify header CRC
     blob_record_hdr_t tmp = h;
     tmp.header_crc32 = 0;
     if (crc32_ieee(&tmp, sizeof(tmp)) != h.header_crc32) return -EIO;
